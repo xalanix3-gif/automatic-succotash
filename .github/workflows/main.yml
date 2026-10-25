@@ -1,0 +1,159 @@
+name: Build iOS from ZIP
+
+# W repozytorium dodaj ten plik jako .github/workflows/build-ios.yml
+# i jeden ZIP projektu w katalogu głównym. Workflow sam rozpakowuje ZIP.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate and unpack project
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "project.yml" ]; then
+            PROJECT_DIR="$GITHUB_WORKSPACE"
+          else
+            ZIPS=()
+            while IFS= read -r item; do
+              ZIPS+=("$item")
+            done < <(find . -maxdepth 1 -type f -iname '*.zip' -print | sort)
+            if [ "${#ZIPS[@]}" -eq 0 ]; then
+              echo "::error::Brak project.yml i pliku ZIP w katalogu głównym repozytorium."
+              exit 1
+            fi
+            if [ "${#ZIPS[@]}" -ne 1 ]; then
+              echo "::error::Zostaw w katalogu głównym dokładnie jeden ZIP z projektem."
+              printf '%s\n' "${ZIPS[@]}"
+              exit 1
+            fi
+            rm -rf _project
+            mkdir -p _project
+            unzip -q -o "${ZIPS[0]}" -d _project
+            PROJECT_YML="$(find _project -name project.yml -not -path '*/__MACOSX/*' -print -quit)"
+            if [ -z "$PROJECT_YML" ]; then
+              echo "::error::W archiwum nie znaleziono project.yml."
+              exit 1
+            fi
+            PROJECT_DIR="$(cd "$(dirname "$PROJECT_YML")" && pwd)"
+          fi
+          echo "Project directory: $PROJECT_DIR"
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          xcodegen --version
+
+      - name: Generate Xcode project
+        working-directory: ${{ steps.locate.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f project.yml
+          xcodegen generate
+
+      - name: Build unsigned iOS app
+        working-directory: ${{ steps.locate.outputs.dir }}
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          AUDD_TOKEN: ${{ secrets.AUDD_TOKEN }}
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJ="$(find . -maxdepth 1 -type d -name '*.xcodeproj' -print -quit)"
+          if [ -z "$PROJ" ]; then
+            echo "::error::XcodeGen nie utworzył projektu .xcodeproj."
+            exit 1
+          fi
+          PROJ="${PROJ#./}"
+          SCHEME="${PROJ%.xcodeproj}"
+          set -o pipefail
+          xcodebuild build \
+            -project "$PROJ" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            "YOUTUBE_API_KEY=${YOUTUBE_API_KEY:-}" \
+            "AUDD_TOKEN=${AUDD_TOKEN:-}" \
+            "SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}" \
+            "SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}" \
+            2>&1 | tee xcodebuild.log | tail -n 180
+
+      - name: Package IPA
+        id: package
+        working-directory: ${{ steps.locate.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$(find build/Build/Products/Release-iphoneos -maxdepth 1 -type d -name '*.app' -print -quit)"
+          if [ -z "$APP" ]; then
+            echo "::error::Build zakończył się bez pliku .app."
+            exit 1
+          fi
+          NAME="$(basename "$APP" .app)"
+          rm -rf Payload "$NAME.ipa"
+          mkdir Payload
+          cp -R "$APP" Payload/
+          /usr/bin/zip -qry "$NAME.ipa" Payload
+          echo "ipa=$(pwd)/$NAME.ipa" >> "$GITHUB_OUTPUT"
+          ls -lh "$NAME.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MusicPlayer-ipa
+          path: ${{ steps.package.outputs.ipa }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create GitHub release
+        if: success()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "build-${{ github.run_number }}" "${{ steps.package.outputs.ipa }}" \
+            --repo "${{ github.repository }}" \
+            --title "Music Player build ${{ github.run_number }}" \
+            --notes "Niepodpisany IPA. Przed instalacją wymaga podpisania własnym narzędziem."
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ steps.locate.outputs.dir }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
